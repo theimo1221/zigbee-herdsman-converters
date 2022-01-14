@@ -81,11 +81,11 @@ module.exports = [
         model: 'ZNLDP12LM',
         vendor: 'Xiaomi',
         description: 'Aqara smart LED bulb',
-        toZigbee: xiaomiExtend.light_onoff_brightness_colortemp().toZigbee.concat([
+        toZigbee: xiaomiExtend.light_onoff_brightness_colortemp({colorTempRange: [153, 370]}).toZigbee.concat([
             tz.xiaomi_light_power_outage_memory]),
-        fromZigbee: xiaomiExtend.light_onoff_brightness_colortemp().fromZigbee,
+        fromZigbee: xiaomiExtend.light_onoff_brightness_colortemp({colorTempRange: [153, 370]}).fromZigbee,
         // power_on_behavior 'toggle' does not seem to be supported
-        exposes: xiaomiExtend.light_onoff_brightness_colortemp().exposes.concat([
+        exposes: xiaomiExtend.light_onoff_brightness_colortemp({colorTempRange: [153, 370]}).exposes.concat([
             e.power_outage_memory().withAccess(ea.STATE_SET)]),
         ota: ota.zigbeeOTA,
     },
@@ -686,6 +686,11 @@ module.exports = [
             exposes.enum('operation_mode', ea.ALL, ['control_relay', 'decoupled'])
                 .withDescription('Decoupled mode'),
         ],
+        configure: async (device, coordinatorEndpoint, logger) => {
+            device.type = 'Router';
+            device.powerSource = 'Mains (single phase)';
+            device.save();
+        },
     },
     {
         zigbeeModel: ['lumi.switch.b2nacn02'],
@@ -868,19 +873,17 @@ module.exports = [
         zigbeeModel: ['lumi.motion.agl02'],
         model: 'RTCGQ12LM',
         vendor: 'Xiaomi',
-        description: 'Aqara T1 human body movement and illuminance sensor (illuminance not supported for now)',
-        fromZigbee: [fz.occupancy, fz.occupancy_timeout, fz.battery],
-        toZigbee: [tz.occupancy_timeout],
-        exposes: [e.occupancy(), e.battery(),
-            exposes.numeric('occupancy_timeout', exposes.access.ALL).withValueMin(0).withValueMax(65535).withUnit('s')
-                .withDescription('Time in seconds till occupancy goes to false')],
+        description: 'Aqara T1 human body movement and illuminance sensor',
+        fromZigbee: [fz.RTCGQ12LM_occupancy_illuminance, fz.aqara_opple, fz.battery],
+        toZigbee: [tz.aqara_detection_interval],
+        exposes: [e.occupancy(), e.illuminance().withUnit('lx').withDescription('Measured illuminance in lux'),
+            exposes.numeric('detection_interval', ea.ALL).withValueMin(2).withValueMax(65535).withUnit('s')
+                .withDescription('Time interval for detecting actions'), e.battery()],
         meta: {battery: {voltageToPercentage: '3V_2100'}},
         configure: async (device, coordinatorEndpoint, logger) => {
             const endpoint = device.getEndpoint(1);
-            await reporting.bind(endpoint, coordinatorEndpoint, ['genPowerCfg', 'msOccupancySensing']);
-            await reporting.occupancy(endpoint);
-            await reporting.batteryVoltage(endpoint);
-            await endpoint.read('msOccupancySensing', ['pirOToUDelay']);
+            await endpoint.read('genPowerCfg', ['batteryVoltage']);
+            await endpoint.read('aqaraOpple', [0x0102], {manufacturerCode: 0x115f});
         },
     },
     {
@@ -888,15 +891,15 @@ module.exports = [
         model: 'RTCGQ13LM',
         vendor: 'Xiaomi',
         description: 'Aqara high precision motion sensor',
-        fromZigbee: [fz.occupancy_with_timeout, fz.aqara_opple, fz.battery],
-        toZigbee: [tz.RTCGQ13LM_detection_interval, tz.RTCGQ13LM_motion_sensitivity],
-        exposes: [e.occupancy(), e.battery(),
-            exposes.enum('motion_sensitivity', exposes.access.ALL, ['low', 'medium', 'high']),
-            exposes.numeric('detection_interval', exposes.access.ALL).withValueMin(2).withValueMax(180).withUnit('s')
-                .withDescription('Time interval for detecting actions')],
+        fromZigbee: [fz.RTCGQ13LM_occupancy, fz.aqara_opple, fz.battery],
+        toZigbee: [tz.aqara_detection_interval, tz.RTCGQ13LM_motion_sensitivity],
+        exposes: [e.occupancy(), exposes.enum('motion_sensitivity', ea.ALL, ['low', 'medium', 'high']),
+            exposes.numeric('detection_interval', ea.ALL).withValueMin(2).withValueMax(65535).withUnit('s')
+                .withDescription('Time interval for detecting actions'), e.battery()],
         meta: {battery: {voltageToPercentage: '3V_2100'}},
         configure: async (device, coordinatorEndpoint, logger) => {
             const endpoint = device.getEndpoint(1);
+            await endpoint.read('genPowerCfg', ['batteryVoltage']);
             await endpoint.read('aqaraOpple', [0x0102], {manufacturerCode: 0x115f});
             await endpoint.read('aqaraOpple', [0x010c], {manufacturerCode: 0x115f});
         },
@@ -920,6 +923,10 @@ module.exports = [
         fromZigbee: [fz.xiaomi_battery, fz.xiaomi_contact, fz.xiaomi_contact_interval],
         toZigbee: [],
         exposes: [e.battery(), e.contact(), e.temperature(), e.battery_voltage()],
+        configure: async (device) => {
+            device.powerSource = 'Battery';
+            device.save();
+        },
     },
     {
         zigbeeModel: ['lumi.sensor_wleak.aq1'],
@@ -1395,18 +1402,15 @@ module.exports = [
         model: 'SSM-U01',
         vendor: 'Xiaomi',
         description: 'Aqara single switch module T1 (with neutral)',
-        fromZigbee: [fz.on_off, fz.metering, fz.electrical_measurement, fz.device_temperature, fz.aqara_opple],
+        // Ignore energy metering reports, rely on aqara_opple: https://github.com/Koenkk/zigbee2mqtt/issues/10709
+        fromZigbee: [fz.on_off, fz.device_temperature, fz.aqara_opple, fz.ignore_metering, fz.ignore_electrical_measurement,
+            fz.xiaomi_power],
         exposes: [e.switch(), e.energy(), e.power(), e.device_temperature(), e.power_outage_memory(), e.switch_type()],
         toZigbee: [tz.xiaomi_switch_type, tz.on_off, tz.xiaomi_switch_power_outage_memory],
         configure: async (device, coordinatorEndpoint, logger) => {
             const endpoint = device.getEndpoint(1);
-            await reporting.bind(endpoint, coordinatorEndpoint, ['genOnOff', 'haElectricalMeasurement', 'seMetering', 'genDeviceTempCfg']);
+            await reporting.bind(endpoint, coordinatorEndpoint, ['genOnOff', 'genDeviceTempCfg']);
             await reporting.onOff(endpoint);
-            // Gives UNSUPPORTED_ATTRIBUTE on reporting.readEletricalMeasurementMultiplierDivisors.
-            await endpoint.read('haElectricalMeasurement', ['acPowerMultiplier', 'acPowerDivisor']);
-            await reporting.readMeteringMultiplierDivisor(endpoint);
-            await reporting.currentSummDelivered(endpoint);
-            await reporting.activePower(endpoint, {min: 5, max: 600, change: 10});
             await reporting.deviceTemperature(endpoint);
             device.powerSource = 'Mains (single phase)';
             device.save();

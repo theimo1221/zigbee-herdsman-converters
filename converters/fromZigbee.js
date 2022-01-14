@@ -1380,8 +1380,8 @@ const converters = {
             const payload = {
                 action: postfixWithEndpointName(`color_move`, msg, model),
                 action_color: {
-                    x: precisionRound(msg.data.colorx / 65535, 3),
-                    y: precisionRound(msg.data.colory / 65535, 3),
+                    x: precisionRound(msg.data.colorx / 65536, 3),
+                    y: precisionRound(msg.data.colory / 65536, 3),
                 },
                 action_transition_time: msg.data.transtime,
             };
@@ -3672,7 +3672,7 @@ const converters = {
             case tuya.dataPoints.moesSboostHeatingCountdown:
                 return {boost_heating_countdown: value};
             case tuya.dataPoints.moesSreset:
-                break;
+                return {valve_state: value ? 'CLOSED' : 'OPEN'};
             case tuya.dataPoints.moesSwindowDetectionFunktion_A2:
                 return {window_detection: value ? 'ON' : 'OFF'};
             case tuya.dataPoints.moesSwindowDetection:
@@ -4134,6 +4134,51 @@ const converters = {
                 meta.logger.warn(`zigbee-herdsman-converters:SaswellThermostat: Unrecognized DP #${
                     dp} with data ${JSON.stringify(dpValue)}`);
             }
+        },
+    },
+    evanell_thermostat: {
+        cluster: 'manuSpecificTuya',
+        type: ['commandDataResponse', 'commandDataReport'],
+        convert: (model, msg, publish, options, meta) => {
+            const result = {};
+            for (const dpValue of msg.data.dpValues) {
+                const value = tuya.getDataValue(dpValue);
+                switch (dpValue.dp) {
+                case tuya.dataPoints.evanellChildLock:
+                    result.child_lock = value ? 'LOCK' : 'UNLOCK';
+                    break;
+                case tuya.dataPoints.evanellBattery:
+                    result.battery = value;
+                    break;
+                case tuya.dataPoints.evanellHeatingSetpoint:
+                    result.current_heating_setpoint = value/10;
+                    break;
+                case tuya.dataPoints.evanellLocalTemp:
+                    result.local_temperature = value/10;
+                    break;
+                case tuya.dataPoints.evanellMode:
+                    switch (value) {
+                    case 0: // manual
+                        result.system_mode = 'auto';
+                        break;
+                    case 2: // away
+                        result.system_mode = 'heat';
+                        break;
+                    case 3: // auto
+                        result.system_mode = 'off';
+                        break;
+                    default:
+                        meta.logger.warn('zigbee-herdsman-converters:evanell_thermostat: ' +
+                          `Mode ${value} is not recognized.`);
+                        break;
+                    }
+                    break;
+                default:
+                    meta.logger.warn(`zigbee-herdsman-converters:evanell_thermostat: NOT RECOGNIZED ` +
+                      `DP #${dpValue.dp} with data ${JSON.stringify(dpValue)}`);
+                }
+            }
+            return result;
         },
     },
     etop_thermostat: {
@@ -5017,7 +5062,8 @@ const converters = {
     aqara_opple: {
         cluster: 'aqaraOpple',
         type: ['attributeReport', 'readResponse'],
-        options: [exposes.options.precision('temperature'), exposes.options.calibration('temperature')],
+        options: [exposes.options.precision('temperature'), exposes.options.calibration('temperature'),
+            exposes.options.precision('illuminance'), exposes.options.calibration('illuminance', 'percentual')],
         convert: (model, msg, publish, options, meta) => {
             const payload = {};
             if (msg.data.hasOwnProperty('247')) {
@@ -5142,6 +5188,8 @@ const converters = {
                         if (['QBKG19LM', 'QBKG20LM', 'QBKG39LM', 'QBKG41LM', 'QBCZ15LM'].includes(model.model)) {
                             const mapping = model.model === 'QBCZ15LM' ? 'usb' : 'right';
                             payload[`state_${mapping}`] = value === 1 ? 'ON' : 'OFF';
+                        } else if (['RTCGQ12LM'].includes(model.model)) {
+                            payload.illuminance = calibrateAndPrecisionRoundOptions(value, options, 'illuminance');
                         }
                     } else if (index === 149) {
                         payload.energy = precisionRound(value, 2); // 0x95
@@ -5308,6 +5356,65 @@ const converters = {
             payload.illuminance = calibrateAndPrecisionRoundOptions(illuminance, options, 'illuminance');
             payload.illuminance_lux = calibrateAndPrecisionRoundOptions(illuminance, options, 'illuminance_lux');
             return payload;
+        },
+    },
+    RTCGQ12LM_occupancy_illuminance: {
+        cluster: 'aqaraOpple',
+        type: ['attributeReport', 'readResponse'],
+        options: [exposes.options.precision('illuminance'), exposes.options.calibration('illuminance', 'percentual')],
+        convert: (model, msg, publish, options, meta) => {
+            if (msg.data.hasOwnProperty('illuminance')) {
+                // The occupancy sensor only sends a message when motion detected.
+                // Therefore we need to publish the no_motion detected by ourselves.
+                const timeout = meta && meta.state && meta.state.hasOwnProperty('detection_interval') ? meta.state.detection_interval : 60;
+
+                // Stop existing timers because motion is detected and set a new one.
+                globalStore.getValue(msg.endpoint, 'timers', []).forEach((t) => clearTimeout(t));
+                globalStore.putValue(msg.endpoint, 'timers', []);
+
+                if (timeout !== 0) {
+                    const timer = setTimeout(() => {
+                        publish({occupancy: false});
+                    }, timeout * 1000);
+
+                    globalStore.getValue(msg.endpoint, 'timers').push(timer);
+                }
+
+                const illuminance = msg.data['illuminance'] - 65536;
+                return {occupancy: true, illuminance: calibrateAndPrecisionRoundOptions(illuminance, options, 'illuminance')};
+            }
+        },
+    },
+    RTCGQ13LM_occupancy: {
+        // This is for occupancy sensor that only send a message when motion detected,
+        // but do not send a motion stop.
+        // Therefore we need to publish the no_motion detected by ourselves.
+        cluster: 'msOccupancySensing',
+        type: ['attributeReport', 'readResponse'],
+        convert: (model, msg, publish, options, meta) => {
+            if (msg.data.occupancy !== 1) {
+                // In case of 0 no occupancy is reported.
+                // https://github.com/Koenkk/zigbee2mqtt/issues/467
+                return;
+            }
+
+            // The occupancy sensor only sends a message when motion detected.
+            // Therefore we need to publish the no_motion detected by ourselves.
+            const timeout = meta && meta.state && meta.state.hasOwnProperty('detection_interval') ? meta.state.detection_interval : 60;
+
+            // Stop existing timers because motion is detected and set a new one.
+            globalStore.getValue(msg.endpoint, 'timers', []).forEach((t) => clearTimeout(t));
+            globalStore.putValue(msg.endpoint, 'timers', []);
+
+            if (timeout !== 0) {
+                const timer = setTimeout(() => {
+                    publish({occupancy: false});
+                }, timeout * 1000);
+
+                globalStore.getValue(msg.endpoint, 'timers').push(timer);
+            }
+
+            return {occupancy: true};
         },
     },
     xiaomi_WXKG01LM_action: {
@@ -7454,41 +7561,58 @@ const converters = {
             const dpValue = tuya.firstDpValue(msg, meta, 'tuya_radar_sensor');
             const dp = dpValue.dp;
             const value = tuya.getDataValue(dpValue);
+            let result = null;
             switch (dp) {
             case tuya.dataPoints.trsPresenceState:
-                return {presence: {0: false, 1: true}[value]};
+                result = {presence: {0: false, 1: true}[value]};
+                break;
             case tuya.dataPoints.trsMotionState:
-                return {motion: {1: false, 2: true}[value]};
+                result = {occupancy: {1: false, 2: true}[value]};
+                break;
             case tuya.dataPoints.trsMotionSpeed:
-                return {motion_speed: value};
+                result = {motion_speed: value};
+                break;
             case tuya.dataPoints.trsMotionDirection:
-                return {motion_direction: {0: 'standing_still', 1: 'moving_forward', 2: 'moving_backward'}[value]};
+                result = {motion_direction: tuya.tuyaRadar.motionDirection[value]};
+                break;
             case tuya.dataPoints.trsScene:
-                return {radar_scene: {'default': 0, 'area': 1, 'toilet': 2, 'bedroom': 3, 'parlour': 4, 'office': 5, 'hotel': 6}[value]};
+                result = {radar_scene: tuya.tuyaRadar.radarScene[value]};
+                break;
             case tuya.dataPoints.trsSensitivity:
-                return {radar_sensitivity: value};
+                result = {radar_sensitivity: value};
+                break;
             case tuya.dataPoints.trsIlluminanceLux:
-                return {illuminance_lux: value};
+                result = {illuminance_lux: value};
+                break;
+            default:
+                meta.logger.warn(`fromZigbee.tuya_radar_sensor: NOT RECOGNIZED DP ${dp} with data ${JSON.stringify(dpValue)}`);
             }
+            return result;
         },
     },
     tuya_smart_vibration_sensor: {
         cluster: 'manuSpecificTuya',
         type: ['commandGetData', 'commandDataResponse', 'raw'],
         convert: (model, msg, publish, options, meta) => {
-            const dp = msg.data.dp;
-            const value = tuya.getDataValue(msg.data.datatype, msg.data.data);
-            switch (dp) {
-            case tuya.dataPoints.state:
-                return {contact: Boolean(value)};
-            case tuya.dataPoints.thitBatteryPercentage:
-                return {battery: value};
-            case tuya.dataPoints.tuyaVibration:
-                return {vibration: Boolean(value)};
-            default:
-                meta.logger.warn(`zigbee-herdsman-converters:tuya_smart_vibration_sensor: NOT RECOGNIZED ` +
-                    `DP #${dp} with data ${JSON.stringify(msg.data)}`);
+            const result = {};
+            for (const dpValue of msg.data.dpValues) {
+                const value = tuya.getDataValue(dpValue);
+                switch (dpValue.dp) {
+                case tuya.dataPoints.state:
+                    result.contact = Boolean(value);
+                    break;
+                case tuya.dataPoints.thitBatteryPercentage:
+                    result.battery = value;
+                    break;
+                case tuya.dataPoints.tuyaVibration:
+                    result.vibration = Boolean(value);
+                    break;
+                default:
+                    meta.logger.warn(`zigbee-herdsman-converters:tuya_smart_vibration_sensor: NOT RECOGNIZED ` +
+                        `DP #${dpValue.dp} with data ${JSON.stringify(dpValue)}`);
+                }
             }
+            return result;
         },
     },
     moes_thermostat_tv: {
@@ -7770,6 +7894,68 @@ const converters = {
             };
         },
     },
+    tuya_light_wz5: {
+        cluster: 'manuSpecificTuya',
+        type: ['commandDataResponse', 'commandDataReport'],
+        convert: (model, msg, publish, options, meta) => {
+            const separateWhite = (model.meta && model.meta.separateWhite);
+            const result = {};
+            // eslint-disable-next-line no-unused-vars
+            for (const [i, dpValue] of msg.data.dpValues.entries()) {
+                const dp = dpValue.dp;
+                const value = tuya.getDataValue(dpValue);
+                if (dp === tuya.dataPoints.state) {
+                    result.state = value ? 'ON': 'OFF';
+                } else if (dp === tuya.dataPoints.silvercrestSetBrightness) {
+                    const brightness = mapNumberRange(value, 0, 1000, 0, 255);
+                    if (separateWhite) {
+                        result.white_brightness = brightness;
+                    } else {
+                        result.brightness = brightness;
+                    }
+                } else if (dp === tuya.dataPoints.silvercrestSetColor) {
+                    const h = parseInt(value.substring(0, 4), 16);
+                    const s = parseInt(value.substring(4, 8), 16);
+                    const b = parseInt(value.substring(8, 12), 16);
+                    result.color_mode = 'hs';
+                    result.color = {hue: h, saturation: mapNumberRange(s, 0, 1000, 0, 100)};
+                    result.brightness = mapNumberRange(b, 0, 1000, 0, 255);
+                } else if (dp === tuya.dataPoints.silvercrestSetColorTemp) {
+                    const [colorTempMin, colorTempMax] = [250, 454];
+                    result.color_temp = mapNumberRange(value, 0, 1000, colorTempMax, colorTempMin);
+                }
+            }
+            return result;
+        },
+    },
+    command_stop_move_raw: {
+        cluster: 'lightingColorCtrl',
+        type: 'raw',
+        convert: (model, msg, publish, options, meta) => {
+            // commandStopMove without params
+            if (msg.data[2] !== 71) return;
+            if (hasAlreadyProcessedMessage(msg)) return;
+            const movestop = 'stop';
+            const action = postfixWithEndpointName(`hue_${movestop}`, msg, model);
+            const payload = {action};
+            addActionGroup(payload, msg, model);
+            return payload;
+        },
+    },
+    tuya_multi_action: {
+        cluster: 'genOnOff',
+        type: 'raw',
+        convert: (model, msg, publish, options, meta) => {
+            if (hasAlreadyProcessedMessage(msg, msg.data[2])) return;
+            let action;
+            if (msg.data[2] == 253) {
+                action = {0: 'single', 1: 'double', 2: 'hold'}[msg.data[3]];
+            } else if (msg.data[2] == 252) {
+                action = {0: 'rotate_right', 1: 'rotate_left'}[msg.data[3]];
+            }
+            return {action};
+        },
+    },
     // #endregion
 
     // #region Ignore converters (these message dont need parsing).
@@ -7926,6 +8112,16 @@ const converters = {
     ignore_tuya_raw: {
         cluster: 'manuSpecificTuya',
         type: ['raw'],
+        convert: (model, msg, publish, options, meta) => null,
+    },
+    ignore_metering: {
+        cluster: 'seMetering',
+        type: ['attributeReport', 'readResponse'],
+        convert: (model, msg, publish, options, meta) => null,
+    },
+    ignore_electrical_measurement: {
+        cluster: 'haElectricalMeasurement',
+        type: ['attributeReport', 'readResponse'],
         convert: (model, msg, publish, options, meta) => null,
     },
     // #endregion

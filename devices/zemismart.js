@@ -5,18 +5,23 @@ const reporting = require('../lib/reporting');
 const extend = require('../lib/extend');
 const e = exposes.presets;
 const tuya = require('../lib/tuya');
+const ea = exposes.access;
 
 const fzLocal = {
     ZMRM02: {
         cluster: 'manuSpecificTuya',
-        type: ['commandGetData', 'commandSetDataResponse'],
+        type: ['commandGetData', 'commandSetDataResponse', 'commandDataResponse'],
         convert: (model, msg, publish, options, meta) => {
             const dpValue = tuya.firstDpValue(msg, meta, 'ZMRM02');
-            const button = dpValue.dp;
-            const actionValue = tuya.getDataValue(dpValue);
-            const lookup = {0: 'single', 1: 'double', 2: 'hold'};
-            const action = lookup[actionValue];
-            return {action: `button_${button}_${action}`};
+            if (dpValue.dp === 10) {
+                return {battery: tuya.getDataValue(dpValue)};
+            } else {
+                const button = dpValue.dp;
+                const actionValue = tuya.getDataValue(dpValue);
+                const lookup = {0: 'single', 1: 'double', 2: 'hold'};
+                const action = lookup[actionValue];
+                return {action: `button_${button}_${action}`};
+            }
         },
     },
 };
@@ -90,12 +95,33 @@ module.exports = [
         fromZigbee: [fzLocal.ZMRM02],
         toZigbee: [],
         onEvent: tuya.onEventSetTime,
-        exposes: [e.action([
+        exposes: [e.battery(), e.action([
             'button_1_hold', 'button_1_single', 'button_1_double',
             'button_2_hold', 'button_2_single', 'button_2_double',
             'button_3_hold', 'button_3_single', 'button_3_double',
             'button_4_hold', 'button_4_single', 'button_4_double',
             'button_5_hold', 'button_5_single', 'button_5_double',
             'button_6_hold', 'button_6_single', 'button_6_double'])],
+    },
+    {
+        fingerprint: [{modelID: 'TS011F', manufacturerName: '_TZ3000_zigisuyh'}],
+        model: 'ZIGBEE-B09-UK',
+        vendor: 'Zemismart',
+        description: 'Zigbee smart outlet universal socket with USB port',
+        fromZigbee: [fz.on_off, fz.tuya_switch_power_outage_memory],
+        toZigbee: [tz.on_off, tz.tuya_switch_power_outage_memory],
+        exposes: [e.switch().withEndpoint('l1'), e.switch().withEndpoint('l2'),
+            exposes.enum('power_outage_memory', ea.STATE_SET, ['on', 'off', 'restore'])
+                .withDescription('Recover state after power outage')],
+        endpoint: (device) => {
+            return {'l1': 1, 'l2': 2};
+        },
+        meta: {multiEndpoint: true},
+        configure: async (device, coordinatorEndpoint, logger) => {
+            await reporting.bind(device.getEndpoint(1), coordinatorEndpoint, ['genOnOff']);
+            await reporting.bind(device.getEndpoint(2), coordinatorEndpoint, ['genOnOff']);
+            await reporting.onOff(device.getEndpoint(1));
+            await reporting.onOff(device.getEndpoint(2));
+        },
     },
 ];
